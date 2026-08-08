@@ -6,7 +6,6 @@ from typing import Any
 
 import yaml
 
-
 DEFAULT_CONFIG: dict[str, Any] = {
     "source_dir": "raw_images",
     "output_dir": "dataset",
@@ -30,7 +29,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as stream:
         supplied = yaml.safe_load(stream) or {}
     if not isinstance(supplied, dict):
-        raise ValueError("Configuration must be a YAML mapping.")
+        raise TypeError("Configuration must be a YAML mapping.")
     config = deepcopy(DEFAULT_CONFIG)
     for key, value in supplied.items():
         if isinstance(value, dict) and isinstance(config.get(key), dict):
