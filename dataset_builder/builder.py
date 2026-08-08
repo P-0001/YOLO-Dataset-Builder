@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import random
 import shutil
 import tempfile
 import zipfile
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import yaml
+from PIL import Image
 
 from .config import load_config
 from .dedupe import find_duplicates
@@ -111,6 +114,38 @@ def _is_built_dataset(folder: Path) -> bool:
     ).is_dir()
 
 
+def _discover_split_first(folder: Path) -> dict[str, list[tuple[Path, Path]]]:
+    """Find image/label pairs in a split-first layout: {split}/images, {split}/labels."""
+    splits: dict[str, list[tuple[Path, Path]]] = {}
+    for child in sorted(folder.iterdir(), key=lambda p: str(p).lower()):
+        if not child.is_dir():
+            continue
+        images_dir = child / "images"
+        labels_dir = child / "labels"
+        if not (images_dir.is_dir() and labels_dir.is_dir()):
+            continue
+        pairs: list[tuple[Path, Path]] = []
+        for image_path in sorted(images_dir.rglob("*"), key=lambda p: str(p).lower()):
+            if image_path.is_file() and image_path.suffix.lower() in _IMAGE_EXTS:
+                label_path = labels_dir / image_path.relative_to(
+                    images_dir
+                ).with_suffix(".txt")
+                if label_path.exists():
+                    pairs.append((image_path, label_path))
+        if pairs:
+            splits[child.name] = pairs
+    return splits
+
+
+def _read_dataset_yaml(folder: Path) -> dict[str, Any] | None:
+    for name in ("dataset.yaml", "data.yaml"):
+        path = folder / name
+        if path.exists():
+            with path.open("r", encoding="utf-8") as stream:
+                return yaml.safe_load(stream) or {}
+    return None
+
+
 def _detect_classes(label_paths: list[Path]) -> list[str]:
     ids: set[int] = set()
     for path in label_paths:
@@ -134,31 +169,90 @@ def _discover_flat_pairs(folder: Path) -> list[tuple[Path, Path]]:
     return pairs
 
 
-def _zip_built_dataset(dataset: Path, zip_path: Path) -> Path:
+def _compress_image_bytes(image_path: Path, max_size: int, jpeg_quality: int) -> bytes:
+    """Downscale (longest side <= max_size) and re-encode an image as JPEG."""
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
+        width, height = image.size
+        scale = min(1.0, float(max_size) / float(max(width, height)))
+        if scale < 1.0:
+            new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+            image = image.resize(new_size, Image.LANCZOS)
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
+        return buffer.getvalue()
+
+
+def _write_train_files(archive: zipfile.ZipFile) -> None:
+    for name, content in _TRAIN_FILES.items():
+        info = zipfile.ZipInfo(name)
+        info.compress_type = zipfile.ZIP_DEFLATED
+        if name == "entrypoint.sh":
+            info.external_attr = 0o755 << 16
+        archive.writestr(info, content)
+
+
+def _zip_built_dataset(dataset: Path, zip_path: Path, compress: dict[str, Any]) -> Path:
     zip_path = zip_path.with_suffix(".zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in dataset.rglob("*"):
-            if path.is_file():
-                archive.write(path, path.relative_to(dataset))
-        for name, content in _TRAIN_FILES.items():
-            info = zipfile.ZipInfo(name)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            if name == "entrypoint.sh":
-                info.external_attr = 0o755 << 16
-            archive.writestr(info, content)
+            if not path.is_file():
+                continue
+            rel = path.relative_to(dataset)
+            if compress["enabled"] and path.suffix.lower() in _IMAGE_EXTS:
+                data = _compress_image_bytes(
+                    path, int(compress["max_size"]), int(compress["jpeg_quality"])
+                )
+                archive.writestr(rel.with_suffix(".jpg"), data)
+            else:
+                archive.write(path, rel)
+        _write_train_files(archive)
     return zip_path
 
 
+def _zip_split_first_dataset(
+    dataset: Path,
+    splits: dict[str, list[tuple[Path, Path]]],
+    classes: list[str],
+    zip_path: Path,
+    compress: dict[str, Any],
+) -> Path:
+    zip_path = zip_path.with_suffix(".zip")
+    total = 0
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for split_name, pairs in splits.items():
+            for image_path, label_path in pairs:
+                stem = image_path.stem
+                if compress["enabled"]:
+                    data = _compress_image_bytes(
+                        image_path,
+                        int(compress["max_size"]),
+                        int(compress["jpeg_quality"]),
+                    )
+                    archive.writestr(f"{split_name}/images/{stem}.jpg", data)
+                else:
+                    ext = image_path.suffix.lower()
+                    archive.write(image_path, f"{split_name}/images/{stem}{ext}")
+                archive.write(label_path, f"{split_name}/labels/{stem}.txt")
+                total += 1
+        data = {
+            "path": ".",
+            **{name: f"{name}/images" for name in splits},
+            "names": {index: name for index, name in enumerate(classes)},
+        }
+        archive.writestr("dataset.yaml", yaml.safe_dump(data, sort_keys=False))
+        _write_train_files(archive)
+    return zip_path, total
+
+
 def _zip_flat_dataset(
-    folder: Path,
     pairs: list[tuple[Path, Path]],
     classes: list[str],
     splits: dict[str, float],
     seed: int,
     zip_path: Path,
+    compress: dict[str, Any],
 ) -> Path:
-    import random
-
     indices = list(range(len(pairs)))
     random.Random(seed).shuffle(indices)
     total = len(indices)
@@ -174,10 +268,18 @@ def _zip_flat_dataset(
         counter = 1
         for i, (image_path, label_path) in enumerate(pairs):
             split = split_map[i]
-            ext = image_path.suffix.lower()
             stem = f"{counter:06d}"
             counter += 1
-            archive.write(image_path, f"images/{split}/{stem}{ext}")
+            if compress["enabled"]:
+                data = _compress_image_bytes(
+                    image_path,
+                    int(compress["max_size"]),
+                    int(compress["jpeg_quality"]),
+                )
+                archive.writestr(f"images/{split}/{stem}.jpg", data)
+            else:
+                ext = image_path.suffix.lower()
+                archive.write(image_path, f"images/{split}/{stem}{ext}")
             archive.write(label_path, f"labels/{split}/{stem}.txt")
 
         data = {
@@ -188,13 +290,7 @@ def _zip_flat_dataset(
             "names": {index: name for index, name in enumerate(classes)},
         }
         archive.writestr("dataset.yaml", yaml.safe_dump(data, sort_keys=False))
-
-        for name, content in _TRAIN_FILES.items():
-            info = zipfile.ZipInfo(name)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            if name == "entrypoint.sh":
-                info.external_attr = 0o755 << 16
-            archive.writestr(info, content)
+        _write_train_files(archive)
     return zip_path
 
 
@@ -210,8 +306,38 @@ def format_to_train(config: dict[str, Any]) -> int:
             raise ValueError(
                 f"Dataset is missing required artifacts for training: {', '.join(missing)}"
             )
-        zip_path = _zip_built_dataset(dataset, dataset.parent / f"{dataset.name}_train")
-        print(f"Training bundle created: {zip_path}")
+        zip_path = _zip_built_dataset(
+            dataset,
+            dataset.parent / f"{dataset.name}_train",
+            config["compress"],
+        )
+        print(
+            f"Training bundle created: {zip_path} "
+            f"({zip_path.stat().st_size / (1024 * 1024):.1f} MB)"
+        )
+        return 0
+
+    split_first = _discover_split_first(dataset)
+    if split_first:
+        existing = _read_dataset_yaml(dataset)
+        if existing and isinstance(existing.get("names"), list):
+            classes = existing["names"]
+        elif existing and isinstance(existing.get("names"), dict):
+            classes = [existing["names"][i] for i in sorted(existing["names"])]
+        else:
+            all_labels = [label for pairs in split_first.values() for _, label in pairs]
+            classes = _detect_classes(all_labels)
+        zip_path, total = _zip_split_first_dataset(
+            dataset,
+            split_first,
+            classes,
+            dataset.parent / f"{dataset.name}_train",
+            config["compress"],
+        )
+        print(
+            f"Training bundle created: {zip_path} ({total} images, "
+            f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB)"
+        )
         return 0
 
     pairs = _discover_flat_pairs(dataset)
@@ -220,16 +346,19 @@ def format_to_train(config: dict[str, Any]) -> int:
             f"No paired image+label files found in {dataset}. "
             "Expected images with sibling .txt label files."
         )
-    classes = config.get("classes") or _detect_classes([label for _, label in pairs])
+    classes = _detect_classes([label for _, label in pairs])
     zip_path = _zip_flat_dataset(
-        dataset,
         pairs,
         classes,
         config["splits"],
         int(config["seed"]),
         dataset.parent / f"{dataset.name}_train",
+        config["compress"],
     )
-    print(f"Training bundle created: {zip_path} ({len(pairs)} images)")
+    print(
+        f"Training bundle created: {zip_path} ({len(pairs)} images, "
+        f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB)"
+    )
     return 0
 
 

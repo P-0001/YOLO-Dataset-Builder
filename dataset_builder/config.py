@@ -17,6 +17,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "create_empty_labels": False,
     "near_duplicate_threshold": 4,
     "quality": {"min_width": 32, "min_height": 32, "max_aspect_ratio": 5.0},
+    "compress": {
+        "enabled": True,
+        "max_size": 1280,
+        "jpeg_quality": 85,
+    },
 }
 
 
@@ -78,3 +83,13 @@ def validate_config(config: dict[str, Any]) -> None:
         for key in ("min_width", "min_height", "max_aspect_ratio")
     ):
         raise ValueError("quality limits must be positive numbers.")
+    compress = config["compress"]
+    if not isinstance(compress["enabled"], bool):
+        raise TypeError("compress.enabled must be a boolean.")
+    if not isinstance(compress["max_size"], int) or compress["max_size"] < 1:
+        raise ValueError("compress.max_size must be a positive integer (pixels).")
+    if (
+        not isinstance(compress["jpeg_quality"], int)
+        or not 1 <= compress["jpeg_quality"] <= 100
+    ):
+        raise ValueError("compress.jpeg_quality must be an integer from 1 to 100.")
