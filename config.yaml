@@ -1,0 +1,24 @@
+# Paths are relative to this configuration file.
+source_dir: raw_images
+output_dir: dataset
+
+# Replace these with your YOLO classes, in class-ID order.
+classes:
+  - object
+
+splits:
+  train: 0.8
+  val: 0.1
+  test: 0.1
+
+seed: 42
+create_empty_labels: true
+near_duplicate_threshold: 4
+
+# Set to a positive number to limit concurrent image checks; 0 chooses automatically.
+workers: 0
+
+quality:
+  min_width: 32
+  min_height: 32
+  max_aspect_ratio: 5.0
