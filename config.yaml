@@ -30,3 +30,10 @@ compress:
   enabled: true
   max_size: 1280
   jpeg_quality: 85
+
+# Base YOLO weights bundled in the training zip produced by `format-to-train`.
+# Common options: yolo11n.pt, yolo11s.pt, yolo11m.pt, yolo11l.pt, yolo11x.pt
+# (n=nano fastest, x=xlargest most accurate). Can still be overridden at runtime
+# via `python train.py --model <weights>`.
+train:
+  model: yolo11m.pt

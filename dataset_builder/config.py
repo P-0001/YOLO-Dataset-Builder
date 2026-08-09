@@ -22,6 +22,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_size": 1280,
         "jpeg_quality": 85,
     },
+    "train": {"model": "yolo11m.pt"},
 }
 
 
@@ -93,3 +94,6 @@ def validate_config(config: dict[str, Any]) -> None:
         or not 1 <= compress["jpeg_quality"] <= 100
     ):
         raise ValueError("compress.jpeg_quality must be an integer from 1 to 100.")
+    train = config["train"]
+    if not isinstance(train["model"], str) or not train["model"].strip():
+        raise ValueError("train.model must be a non-empty string (e.g. yolo11s.pt).")

@@ -43,7 +43,7 @@ from ultralytics import YOLO
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train YOLO on the bundled dataset.")
-    parser.add_argument("--model", default="yolo11s.pt", help="Base model weights (default: yolo11s.pt)")
+    parser.add_argument("--model", default="__MODEL__", help="Base model weights (default: __MODEL__)")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs (default: 100)")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size (default: 640)")
     parser.add_argument("--batch", type=int, default=16, help="Batch size (default: 16)")
@@ -183,8 +183,10 @@ def _compress_image_bytes(image_path: Path, max_size: int, jpeg_quality: int) ->
         return buffer.getvalue()
 
 
-def _write_train_files(archive: zipfile.ZipFile) -> None:
+def _write_train_files(archive: zipfile.ZipFile, model: str) -> None:
     for name, content in _TRAIN_FILES.items():
+        if name == "train.py":
+            content = content.replace("__MODEL__", model)
         info = zipfile.ZipInfo(name)
         info.compress_type = zipfile.ZIP_DEFLATED
         if name == "entrypoint.sh":
@@ -192,7 +194,9 @@ def _write_train_files(archive: zipfile.ZipFile) -> None:
         archive.writestr(info, content)
 
 
-def _zip_built_dataset(dataset: Path, zip_path: Path, compress: dict[str, Any]) -> Path:
+def _zip_built_dataset(
+    dataset: Path, zip_path: Path, compress: dict[str, Any], model: str
+) -> Path:
     zip_path = zip_path.with_suffix(".zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in dataset.rglob("*"):
@@ -206,7 +210,7 @@ def _zip_built_dataset(dataset: Path, zip_path: Path, compress: dict[str, Any]) 
                 archive.writestr(rel.with_suffix(".jpg"), data)
             else:
                 archive.write(path, rel)
-        _write_train_files(archive)
+        _write_train_files(archive, model)
     return zip_path
 
 
@@ -216,6 +220,7 @@ def _zip_split_first_dataset(
     classes: list[str],
     zip_path: Path,
     compress: dict[str, Any],
+    model: str,
 ) -> Path:
     zip_path = zip_path.with_suffix(".zip")
     total = 0
@@ -241,7 +246,7 @@ def _zip_split_first_dataset(
             "names": {index: name for index, name in enumerate(classes)},
         }
         archive.writestr("dataset.yaml", yaml.safe_dump(data, sort_keys=False))
-        _write_train_files(archive)
+        _write_train_files(archive, model)
     return zip_path, total
 
 
@@ -252,6 +257,7 @@ def _zip_flat_dataset(
     seed: int,
     zip_path: Path,
     compress: dict[str, Any],
+    model: str,
 ) -> Path:
     indices = list(range(len(pairs)))
     random.Random(seed).shuffle(indices)
@@ -290,7 +296,7 @@ def _zip_flat_dataset(
             "names": {index: name for index, name in enumerate(classes)},
         }
         archive.writestr("dataset.yaml", yaml.safe_dump(data, sort_keys=False))
-        _write_train_files(archive)
+        _write_train_files(archive, model)
     return zip_path
 
 
@@ -299,6 +305,7 @@ def format_to_train(config: dict[str, Any]) -> int:
     if not dataset.is_dir():
         raise FileNotFoundError(f"output_dir does not exist: {dataset}")
     dataset = dataset.resolve()
+    model = config["train"]["model"]
 
     if _is_built_dataset(dataset):
         missing = _validate_train_dataset(dataset)
@@ -310,10 +317,11 @@ def format_to_train(config: dict[str, Any]) -> int:
             dataset,
             dataset.parent / f"{dataset.name}_train",
             config["compress"],
+            model,
         )
         print(
             f"Training bundle created: {zip_path} "
-            f"({zip_path.stat().st_size / (1024 * 1024):.1f} MB)"
+            f"({zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model})"
         )
         return 0
 
@@ -333,10 +341,11 @@ def format_to_train(config: dict[str, Any]) -> int:
             classes,
             dataset.parent / f"{dataset.name}_train",
             config["compress"],
+            model,
         )
         print(
             f"Training bundle created: {zip_path} ({total} images, "
-            f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB)"
+            f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model})"
         )
         return 0
 
@@ -354,10 +363,11 @@ def format_to_train(config: dict[str, Any]) -> int:
         int(config["seed"]),
         dataset.parent / f"{dataset.name}_train",
         config["compress"],
+        model,
     )
     print(
         f"Training bundle created: {zip_path} ({len(pairs)} images, "
-        f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB)"
+        f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model})"
     )
     return 0
 
