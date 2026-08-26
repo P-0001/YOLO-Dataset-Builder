@@ -16,6 +16,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "workers": 0,
     "create_empty_labels": False,
     "near_duplicate_threshold": 4,
+    "skip_classes": [],
     "quality": {"min_width": 32, "min_height": 32, "max_aspect_ratio": 5.0},
     "compress": {
         "enabled": True,
@@ -78,6 +79,11 @@ def validate_config(config: dict[str, Any]) -> None:
         or not 0 <= config["near_duplicate_threshold"] <= 7
     ):
         raise ValueError("near_duplicate_threshold must be an integer from 0 to 7.")
+    skip = config["skip_classes"]
+    if not isinstance(skip, list) or not all(
+        isinstance(cid, int) and cid >= 0 for cid in skip
+    ):
+        raise ValueError("skip_classes must be a list of non-negative integers.")
     quality = config["quality"]
     if not all(
         isinstance(quality[key], (int, float)) and quality[key] > 0

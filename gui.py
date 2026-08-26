@@ -76,8 +76,8 @@ class DatasetBuilderGui:
     def __init__(self, root: Tk) -> None:
         self.root = root
         root.title("YOLO Dataset Builder")
-        root.geometry("1120x920")
-        root.minsize(900, 720)
+        root.geometry("1120x960")
+        root.minsize(900, 760)
         root.configure(background=self.BG)
         self._configure_styles()
         self.config_base = copy.deepcopy(DEFAULT_CONFIG)
@@ -90,6 +90,36 @@ class DatasetBuilderGui:
         )
         self.seed, self.status = StringVar(value="42"), StringVar(value="Ready")
         self.empty_labels = BooleanVar(value=True)
+        # Newly exposed config fields (kept in sync with config_base at build time).
+        self.extensions = StringVar(
+            value=", ".join(DEFAULT_CONFIG["extensions"])
+        )
+        self.workers = StringVar(value=str(DEFAULT_CONFIG["workers"]))
+        self.near_duplicate_threshold = StringVar(
+            value=str(DEFAULT_CONFIG["near_duplicate_threshold"])
+        )
+        self.min_width = StringVar(
+            value=str(DEFAULT_CONFIG["quality"]["min_width"])
+        )
+        self.min_height = StringVar(
+            value=str(DEFAULT_CONFIG["quality"]["min_height"])
+        )
+        self.max_aspect_ratio = StringVar(
+            value=str(DEFAULT_CONFIG["quality"]["max_aspect_ratio"])
+        )
+        self.compress_enabled = BooleanVar(
+            value=bool(DEFAULT_CONFIG["compress"]["enabled"])
+        )
+        self.compress_max_size = StringVar(
+            value=str(DEFAULT_CONFIG["compress"]["max_size"])
+        )
+        self.compress_jpeg_quality = StringVar(
+            value=str(DEFAULT_CONFIG["compress"]["jpeg_quality"])
+        )
+        self.train_model = StringVar(
+            value=str(DEFAULT_CONFIG["train"]["model"])
+        )
+        self.skip_classes = StringVar(value="")
         self.buttons: list[ttk.Button] = []
         self.action_buttons: list[ttk.Button] = []
         self.fields: dict[str, ttk.Entry] = {}
@@ -103,15 +133,64 @@ class DatasetBuilderGui:
         content = ttk.Frame(root, style="App.TFrame", padding=(28, 24))
         content.grid(sticky="nsew")
         content.columnconfigure(0, weight=1)
-        content.rowconfigure(3, weight=1)
+        content.rowconfigure(1, weight=1)
         self._make_header(content)
 
+        self.notebook = ttk.Notebook(content, style="App.TNotebook")
+        self.notebook.grid(row=1, column=0, sticky="nsew", pady=(20, 14))
+        self._build_tab = ttk.Frame(
+            self.notebook, style="App.TFrame", padding=(0, 6)
+        )
+        self._export_tab = ttk.Frame(
+            self.notebook, style="App.TFrame", padding=(0, 6)
+        )
+        self._build_tab.columnconfigure(0, weight=1)
+        self._export_tab.columnconfigure(0, weight=1)
+        self.notebook.add(self._build_tab, text="Build & Verify", sticky="nsew")
+        self.notebook.add(self._export_tab, text="Export", sticky="nsew")
+
+        self._build_build_tab(self._build_tab)
+        self._build_export_tab(self._export_tab)
+        self._build_activity(content)
+
+        self.source.trace_add("write", self._on_source_change)
+        for variable in (
+            self.output,
+            self.classes,
+            self.train,
+            self.val,
+            self.test,
+            self.seed,
+            self.extensions,
+            self.workers,
+            self.near_duplicate_threshold,
+            self.min_width,
+            self.min_height,
+            self.max_aspect_ratio,
+            self.compress_max_size,
+            self.compress_jpeg_quality,
+            self.train_model,
+            self.skip_classes,
+        ):
+            variable.trace_add("write", self._on_form_change)
+        self.empty_labels.trace_add("write", self._on_form_change)
+        self.compress_enabled.trace_add("write", self._on_form_change)
+        self._enable_drop_targets()
+        self._validate_form()
+        self._update_shortcuts()
+        self._update_estimate()
+        self._append(
+            "Ready. Choose your source and a new output folder to begin.", "info"
+        )
+
+    # ------------------------------------------------------------------ tabs
+    def _build_build_tab(self, parent: ttk.Frame) -> None:
         setup = self._card(
-            content,
+            parent,
             "DATASET SETUP",
             "Choose where to read images and where to create the new dataset.",
         )
-        setup.grid(row=1, column=0, sticky="ew", pady=(20, 12))
+        setup.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         setup.columnconfigure(1, weight=1)
         self._path_row(setup, 0, "Source folder", self.source, True, "source")
         self._path_row(setup, 1, "New output folder", self.output, False, "output")
@@ -135,11 +214,11 @@ class DatasetBuilderGui:
         )
 
         options = self._card(
-            content,
+            parent,
             "BUILD OPTIONS",
             "Fine-tune labels, deterministic splits, and image handling.",
         )
-        options.grid(row=2, column=0, sticky="ew", pady=(0, 14))
+        options.grid(row=1, column=0, sticky="ew", pady=(0, 12))
         options.columnconfigure(1, weight=1)
         self._entry(options, 2, "Classes", self.classes, "classes")
         splits = ttk.Frame(options, style="Card.TFrame")
@@ -181,16 +260,50 @@ class DatasetBuilderGui:
             style="Purple.TCheckbutton",
         ).grid(row=8, column=1, sticky="w", pady=(8, 4))
 
-        activity = self._card(
-            content,
-            "ACTIVITY",
-            "Progress, useful shortcuts, and the latest dataset summary.",
+        advanced = self._card(
+            parent,
+            "ADVANCED",
+            "File types, parallelism, deduplication, and quality gates.",
         )
-        activity.grid(row=3, column=0, sticky="nsew")
-        activity.columnconfigure(0, weight=1)
-        activity.rowconfigure(6, weight=1)
-        actions = ttk.Frame(activity, style="Card.TFrame")
-        actions.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        advanced.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        advanced.columnconfigure(1, weight=1)
+        self._entry(advanced, 0, "Extensions", self.extensions, "extensions")
+        self._entry(advanced, 2, "Workers", self.workers, "workers")
+        self._entry(
+            advanced,
+            4,
+            "Near-duplicate threshold",
+            self.near_duplicate_threshold,
+            "near_duplicate_threshold",
+        )
+        quality = ttk.Frame(advanced, style="Card.TFrame")
+        ttk.Label(quality, text="QUALITY", style="FieldLabel.TLabel").pack(
+            side="left", padx=(0, 16)
+        )
+        for label, variable, name in (
+            ("Min width", self.min_width, "min_width"),
+            ("Min height", self.min_height, "min_height"),
+            ("Max aspect", self.max_aspect_ratio, "max_aspect_ratio"),
+        ):
+            group = ttk.Frame(quality, style="Card.TFrame")
+            group.pack(side="left", padx=(0, 14))
+            ttk.Label(group, text=label, style="Muted.TLabel").pack(anchor="w")
+            entry = ttk.Entry(
+                group, textvariable=variable, width=8, style="Input.TEntry"
+            )
+            entry.pack(pady=(3, 0))
+            self.fields[name] = entry
+        ttk.Label(advanced, text="Quality", style="FieldLabel.TLabel").grid(
+            row=6, column=0, sticky="w", pady=8
+        )
+        quality.grid(row=6, column=1, sticky="w", pady=8)
+        self.field_errors["quality"] = ttk.Label(
+            advanced, text="", style="Error.TLabel"
+        )
+        self.field_errors["quality"].grid(row=7, column=1, sticky="w")
+
+        actions = ttk.Frame(parent, style="App.TFrame")
+        actions.grid(row=3, column=0, sticky="w", pady=(4, 0))
         self._button(
             actions,
             "Build dataset",
@@ -212,17 +325,101 @@ class DatasetBuilderGui:
             "Secondary.TButton",
             action=True,
         )
+        self._button(actions, "Load config", self.load_config, "Secondary.TButton")
+        self._button(actions, "Save config", self.save_config, "Secondary.TButton")
+
+    def _build_export_tab(self, parent: ttk.Frame) -> None:
+        source_card = self._card(
+            parent,
+            "DATASET TO EXPORT",
+            "Pick the built dataset or flat image+label folder to bundle for training.",
+        )
+        source_card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        source_card.columnconfigure(1, weight=1)
+        self._path_row(
+            source_card, 0, "Dataset folder", self.output, True, "output"
+        )
+        ttk.Label(
+            source_card,
+            text="This is the same output folder used on the Build & Verify tab.",
+            style="Muted.TLabel",
+        ).grid(row=4, column=1, sticky="w", pady=(0, 3))
+
+        export = self._card(
+            parent,
+            "EXPORT OPTIONS",
+            "Training bundle (.zip) settings. Labels are read from sibling .txt files.",
+        )
+        export.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        export.columnconfigure(1, weight=1)
+        self._entry(export, 0, "Base model", self.train_model, "train_model")
+        ttk.Checkbutton(
+            export,
+            text="Compress images (downscale + JPEG re-encode)",
+            variable=self.compress_enabled,
+            style="Purple.TCheckbutton",
+        ).grid(row=2, column=1, sticky="w", pady=(8, 4))
+        compress = ttk.Frame(export, style="Card.TFrame")
+        ttk.Label(compress, text="COMPRESS", style="FieldLabel.TLabel").pack(
+            side="left", padx=(0, 16)
+        )
+        for label, variable, name in (
+            ("Max size (px)", self.compress_max_size, "compress_max_size"),
+            ("JPEG quality", self.compress_jpeg_quality, "compress_jpeg_quality"),
+        ):
+            group = ttk.Frame(compress, style="Card.TFrame")
+            group.pack(side="left", padx=(0, 14))
+            ttk.Label(group, text=label, style="Muted.TLabel").pack(anchor="w")
+            entry = ttk.Entry(
+                group, textvariable=variable, width=10, style="Input.TEntry"
+            )
+            entry.pack(pady=(3, 0))
+            self.fields[name] = entry
+        ttk.Label(export, text="Compress", style="FieldLabel.TLabel").grid(
+            row=4, column=0, sticky="w", pady=8
+        )
+        compress.grid(row=4, column=1, sticky="w", pady=8)
+        self.field_errors["compress"] = ttk.Label(
+            export, text="", style="Error.TLabel"
+        )
+        self.field_errors["compress"].grid(row=5, column=1, sticky="w")
+        self._entry(export, 6, "Skip class IDs", self.skip_classes, "skip_classes")
+        ttk.Label(
+            export,
+            text="Comma-separated class IDs to drop from labels (e.g. 0). "
+            "Remaining IDs are NOT renumbered. Images whose labels become empty are dropped.",
+            style="Muted.TLabel",
+        ).grid(row=8, column=1, sticky="w", pady=(0, 3))
+
+        actions = ttk.Frame(parent, style="App.TFrame")
+        actions.grid(row=2, column=0, sticky="w", pady=(4, 0))
         self._button(
             actions,
             "Format to train",
             lambda: self._start(format_to_train),
-            "Secondary.TButton",
+            "Primary.TButton",
             action=True,
         )
-        self._button(actions, "Load config", self.load_config, "Secondary.TButton")
-        self._button(actions, "Save config", self.save_config, "Secondary.TButton")
+        ttk.Label(
+            parent,
+            text=(
+                "Format to train creates <folder>_train.zip next to the dataset, "
+                "with images, labels, dataset.yaml, and a ready-to-run train.py."
+            ),
+            style="Muted.TLabel",
+        ).grid(row=3, column=0, sticky="w", pady=(10, 0))
+
+    def _build_activity(self, parent: ttk.Frame) -> None:
+        activity = self._card(
+            parent,
+            "ACTIVITY",
+            "Progress, useful shortcuts, and the latest dataset summary.",
+        )
+        activity.grid(row=2, column=0, sticky="nsew")
+        activity.columnconfigure(0, weight=1)
+        activity.rowconfigure(6, weight=1)
         shortcuts = ttk.Frame(activity, style="Card.TFrame")
-        shortcuts.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        shortcuts.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(shortcuts, textvariable=self.status, style="Status.TLabel").pack(
             side="left", padx=(0, 16)
         )
@@ -293,25 +490,6 @@ class DatasetBuilderGui:
         ttk.Button(
             log_actions, text="Copy log", command=self.copy_log, style="Quiet.TButton"
         ).pack(side="left")
-
-        self.source.trace_add("write", self._on_source_change)
-        for variable in (
-            self.output,
-            self.classes,
-            self.train,
-            self.val,
-            self.test,
-            self.seed,
-        ):
-            variable.trace_add("write", self._on_form_change)
-        self.empty_labels.trace_add("write", self._on_form_change)
-        self._enable_drop_targets()
-        self._validate_form()
-        self._update_shortcuts()
-        self._update_estimate()
-        self._append(
-            "Ready. Choose your source and a new output folder to begin.", "info"
-        )
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -473,6 +651,23 @@ class DatasetBuilderGui:
             bordercolor=self.SURFACE_ALT,
             lightcolor=self.ACCENT,
             darkcolor=self.ACCENT,
+        )
+        # Notebook (tabs) styling to match the dark theme.
+        style.configure(
+            "App.TNotebook", background=self.BG, borderwidth=0, tabmargins=(0, 4, 0, 0)
+        )
+        style.configure(
+            "App.TNotebook.Tab",
+            background=self.SURFACE_ALT,
+            foreground=self.MUTED,
+            borderwidth=0,
+            padding=(18, 8),
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.map(
+            "App.TNotebook.Tab",
+            background=[("selected", self.SURFACE)],
+            foreground=[("selected", self.TEXT)],
         )
 
     def _make_header(self, parent: ttk.Frame) -> None:
@@ -648,7 +843,11 @@ class DatasetBuilderGui:
             self.estimate.set("Estimate: choose a source folder.")
             return
         self.estimate.set("Estimate: counting source images…")
-        extensions = {extension.lower() for extension in self.config_base["extensions"]}
+        extensions = {
+            extension.strip().lower()
+            for extension in self.extensions.get().split(",")
+            if extension.strip()
+        }
 
         def count_images() -> None:
             files = total_bytes = 0
@@ -689,6 +888,16 @@ class DatasetBuilderGui:
     def _set_error(self, name: str, message: str) -> None:
         if name == "splits":
             for key in ("train", "val", "test"):
+                self.fields[key].configure(
+                    style="Invalid.TEntry" if message else "Input.TEntry"
+                )
+        elif name == "quality":
+            for key in ("min_width", "min_height", "max_aspect_ratio"):
+                self.fields[key].configure(
+                    style="Invalid.TEntry" if message else "Input.TEntry"
+                )
+        elif name == "compress":
+            for key in ("compress_max_size", "compress_jpeg_quality"):
                 self.fields[key].configure(
                     style="Invalid.TEntry" if message else "Input.TEntry"
                 )
@@ -734,12 +943,90 @@ class DatasetBuilderGui:
         except ValueError:
             seed_error = "Seed must be a whole number."
         self._set_error("seed", seed_error)
+        # Extensions
+        exts = [
+            e.strip()
+            for e in self.extensions.get().split(",")
+            if e.strip()
+        ]
+        ext_error = (
+            ""
+            if exts and all(e.startswith(".") for e in exts)
+            else "Extensions must be a comma-separated list starting with '.'"
+        )
+        self._set_error("extensions", ext_error)
+        # Workers
+        try:
+            workers = int(self.workers.get())
+            workers_error = "" if workers >= 0 else "Workers must be 0 or a positive integer."
+        except ValueError:
+            workers_error = "Workers must be a whole number."
+            workers = -1
+        self._set_error("workers", workers_error)
+        # Near-duplicate threshold
+        try:
+            ndt = int(self.near_duplicate_threshold.get())
+            ndt_error = (
+                "" if 0 <= ndt <= 7 else "Near-duplicate threshold must be 0 to 7."
+            )
+        except ValueError:
+            ndt_error = "Near-duplicate threshold must be a whole number."
+            ndt = -1
+        self._set_error("near_duplicate_threshold", ndt_error)
+        # Quality
+        quality_error = ""
+        try:
+            mw = float(self.min_width.get())
+            mh = float(self.min_height.get())
+            mar = float(self.max_aspect_ratio.get())
+            if not (mw > 0 and mh > 0 and mar > 0):
+                quality_error = "Quality limits must be positive numbers."
+        except ValueError:
+            quality_error = "Quality limits must be numbers."
+        self._set_error("quality", quality_error)
+        # Compress
+        compress_error = ""
+        try:
+            ms = int(self.compress_max_size.get())
+            jq = int(self.compress_jpeg_quality.get())
+            if ms < 1:
+                compress_error = "Max size must be a positive integer."
+            elif not 1 <= jq <= 100:
+                compress_error = "JPEG quality must be 1 to 100."
+        except ValueError:
+            compress_error = "Compress values must be whole numbers."
+        self._set_error("compress", compress_error)
+        # Train model
+        model_error = "" if self.train_model.get().strip() else "Enter a base model."
+        self._set_error("train_model", model_error)
+        # Skip class IDs (optional, comma-separated non-negative integers)
+        skip_error = ""
+        skip_raw = [
+            token.strip()
+            for token in self.skip_classes.get().split(",")
+            if token.strip()
+        ]
+        try:
+            skip_ids = [int(token) for token in skip_raw]
+            if any(cid < 0 for cid in skip_ids):
+                skip_error = "Skip class IDs must be non-negative integers."
+        except ValueError:
+            skip_error = "Skip class IDs must be whole numbers (e.g. 0, 2)."
+        self._set_error("skip_classes", skip_error)
+
         valid = not any(
             (
                 not source or not source.is_dir(),
                 bool(output_error),
                 bool(split_error),
                 bool(seed_error),
+                bool(ext_error),
+                bool(workers_error),
+                bool(ndt_error),
+                bool(quality_error),
+                bool(compress_error),
+                bool(model_error),
+                bool(skip_error),
                 not [
                     item.strip()
                     for item in self.classes.get().split(",")
@@ -769,6 +1056,29 @@ class DatasetBuilderGui:
                 },
                 "seed": int(self.seed.get()),
                 "create_empty_labels": self.empty_labels.get(),
+                "extensions": [
+                    e.strip().lower()
+                    for e in self.extensions.get().split(",")
+                    if e.strip()
+                ],
+                "workers": int(self.workers.get()),
+                "near_duplicate_threshold": int(self.near_duplicate_threshold.get()),
+                "quality": {
+                    "min_width": float(self.min_width.get()),
+                    "min_height": float(self.min_height.get()),
+                    "max_aspect_ratio": float(self.max_aspect_ratio.get()),
+                },
+                "compress": {
+                    "enabled": bool(self.compress_enabled.get()),
+                    "max_size": int(self.compress_max_size.get()),
+                    "jpeg_quality": int(self.compress_jpeg_quality.get()),
+                },
+                "train": {"model": self.train_model.get().strip()},
+                "skip_classes": [
+                    int(token.strip())
+                    for token in self.skip_classes.get().split(",")
+                    if token.strip()
+                ],
             }
         )
         validate_config(config)
@@ -916,6 +1226,8 @@ class DatasetBuilderGui:
         )
         if command is build and result == 0:
             self._verify_output_files()
+        if command is format_to_train:
+            self.notebook.select(self._export_tab)
         self._load_summary()
         for button in self.buttons:
             button.configure(state="normal")
@@ -1027,6 +1339,21 @@ class DatasetBuilderGui:
             self.test.set(str(config["splits"]["test"]))
             self.seed.set(str(config["seed"]))
             self.empty_labels.set(bool(config["create_empty_labels"]))
+            self.extensions.set(", ".join(config["extensions"]))
+            self.workers.set(str(config["workers"]))
+            self.near_duplicate_threshold.set(
+                str(config["near_duplicate_threshold"])
+            )
+            self.min_width.set(str(config["quality"]["min_width"]))
+            self.min_height.set(str(config["quality"]["min_height"]))
+            self.max_aspect_ratio.set(str(config["quality"]["max_aspect_ratio"]))
+            self.compress_enabled.set(bool(config["compress"]["enabled"]))
+            self.compress_max_size.set(str(config["compress"]["max_size"]))
+            self.compress_jpeg_quality.set(str(config["compress"]["jpeg_quality"]))
+            self.train_model.set(str(config["train"]["model"]))
+            self.skip_classes.set(
+                ", ".join(str(cid) for cid in config.get("skip_classes", []))
+            )
             self._append(f"Loaded configuration: {path}", "success")
         except (OSError, ValueError, TypeError, KeyError) as exc:
             self._append(f"Could not load configuration: {exc}", "error")
@@ -1080,6 +1407,29 @@ class DatasetBuilderGui:
             self.test.set(saved.get("test", self.test.get()))
             self.seed.set(saved.get("seed", self.seed.get()))
             self.empty_labels.set(saved.get("empty_labels", self.empty_labels.get()))
+            self.extensions.set(saved.get("extensions", self.extensions.get()))
+            self.workers.set(saved.get("workers", self.workers.get()))
+            self.near_duplicate_threshold.set(
+                saved.get(
+                    "near_duplicate_threshold", self.near_duplicate_threshold.get()
+                )
+            )
+            self.min_width.set(saved.get("min_width", self.min_width.get()))
+            self.min_height.set(saved.get("min_height", self.min_height.get()))
+            self.max_aspect_ratio.set(
+                saved.get("max_aspect_ratio", self.max_aspect_ratio.get())
+            )
+            self.compress_enabled.set(
+                saved.get("compress_enabled", self.compress_enabled.get())
+            )
+            self.compress_max_size.set(
+                saved.get("compress_max_size", self.compress_max_size.get())
+            )
+            self.compress_jpeg_quality.set(
+                saved.get("compress_jpeg_quality", self.compress_jpeg_quality.get())
+            )
+            self.train_model.set(saved.get("train_model", self.train_model.get()))
+            self.skip_classes.set(saved.get("skip_classes", self.skip_classes.get()))
         except (OSError, ValueError, TypeError):
             pass
 
@@ -1094,6 +1444,17 @@ class DatasetBuilderGui:
             "test": self.test.get(),
             "seed": self.seed.get(),
             "empty_labels": self.empty_labels.get(),
+            "extensions": self.extensions.get(),
+            "workers": self.workers.get(),
+            "near_duplicate_threshold": self.near_duplicate_threshold.get(),
+            "min_width": self.min_width.get(),
+            "min_height": self.min_height.get(),
+            "max_aspect_ratio": self.max_aspect_ratio.get(),
+            "compress_enabled": self.compress_enabled.get(),
+            "compress_max_size": self.compress_max_size.get(),
+            "compress_jpeg_quality": self.compress_jpeg_quality.get(),
+            "train_model": self.train_model.get(),
+            "skip_classes": self.skip_classes.get(),
         }
         try:
             self._preferences_file().write_text(
@@ -1122,6 +1483,19 @@ class DatasetBuilderGui:
         self.test.set("0.1")
         self.seed.set("42")
         self.empty_labels.set(True)
+        self.extensions.set(", ".join(DEFAULT_CONFIG["extensions"]))
+        self.workers.set(str(DEFAULT_CONFIG["workers"]))
+        self.near_duplicate_threshold.set(
+            str(DEFAULT_CONFIG["near_duplicate_threshold"])
+        )
+        self.min_width.set(str(DEFAULT_CONFIG["quality"]["min_width"]))
+        self.min_height.set(str(DEFAULT_CONFIG["quality"]["min_height"]))
+        self.max_aspect_ratio.set(str(DEFAULT_CONFIG["quality"]["max_aspect_ratio"]))
+        self.compress_enabled.set(bool(DEFAULT_CONFIG["compress"]["enabled"]))
+        self.compress_max_size.set(str(DEFAULT_CONFIG["compress"]["max_size"]))
+        self.compress_jpeg_quality.set(str(DEFAULT_CONFIG["compress"]["jpeg_quality"]))
+        self.train_model.set(str(DEFAULT_CONFIG["train"]["model"]))
+        self.skip_classes.set("")
         self.status.set("Preferences reset")
         self._append("Saved preferences reset.", "success")
 

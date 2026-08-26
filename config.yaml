@@ -4,7 +4,10 @@ output_dir: dataset
 
 # Replace these with your YOLO classes, in class-ID order.
 classes:
-  - object
+  - enemy
+  - icon
+  - goalie
+  - ball
 
 splits:
   train: 0.8

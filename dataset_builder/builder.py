@@ -108,6 +108,31 @@ _TRAIN_FILES = {
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
 
+def _filter_label_text(text: str, skip_ids: set[int]) -> str:
+    """Drop YOLO label lines whose class id is in skip_ids. IDs are not renumbered."""
+    if not skip_ids:
+        return text
+    kept: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            cid = int(stripped.split()[0])
+        except (ValueError, IndexError):
+            kept.append(line)
+            continue
+        if cid not in skip_ids:
+            kept.append(line)
+    return "\n".join(kept) + ("\n" if kept else "")
+
+
+def _read_label_filtered(path: Path, skip_ids: set[int]) -> str:
+    return _filter_label_text(
+        path.read_text(encoding="utf-8", errors="replace"), skip_ids
+    )
+
+
 def _is_built_dataset(folder: Path) -> bool:
     return (folder / "images" / "train").is_dir() and (
         folder / "labels" / "train"
@@ -195,23 +220,60 @@ def _write_train_files(archive: zipfile.ZipFile, model: str) -> None:
 
 
 def _zip_built_dataset(
-    dataset: Path, zip_path: Path, compress: dict[str, Any], model: str
+    dataset: Path,
+    zip_path: Path,
+    compress: dict[str, Any],
+    model: str,
+    skip_ids: set[int],
 ) -> Path:
     zip_path = zip_path.with_suffix(".zip")
+    kept = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for split in ("train", "val", "test"):
+            images_dir = dataset / "images" / split
+            labels_dir = dataset / "labels" / split
+            if not images_dir.is_dir():
+                continue
+            for image_path in sorted(
+                images_dir.rglob("*"), key=lambda p: str(p).lower()
+            ):
+                if not image_path.is_file() or image_path.suffix.lower() not in _IMAGE_EXTS:
+                    continue
+                rel_img = image_path.relative_to(dataset)
+                label_path = labels_dir / image_path.relative_to(
+                    images_dir
+                ).with_suffix(".txt")
+                if skip_ids and label_path.is_file():
+                    filtered = _read_label_filtered(label_path, skip_ids)
+                    if not filtered.strip():
+                        continue
+                if compress["enabled"]:
+                    data = _compress_image_bytes(
+                        image_path,
+                        int(compress["max_size"]),
+                        int(compress["jpeg_quality"]),
+                    )
+                    archive.writestr(rel_img.with_suffix(".jpg"), data)
+                else:
+                    archive.write(image_path, rel_img)
+                if label_path.is_file():
+                    rel_lbl = label_path.relative_to(dataset)
+                    if skip_ids:
+                        archive.writestr(rel_lbl, filtered)
+                    else:
+                        archive.write(label_path, rel_lbl)
+                kept += 1
+        # Non-image/label artifacts (dataset.yaml, reports, configs).
         for path in dataset.rglob("*"):
             if not path.is_file():
                 continue
             rel = path.relative_to(dataset)
-            if compress["enabled"] and path.suffix.lower() in _IMAGE_EXTS:
-                data = _compress_image_bytes(
-                    path, int(compress["max_size"]), int(compress["jpeg_quality"])
-                )
-                archive.writestr(rel.with_suffix(".jpg"), data)
-            else:
-                archive.write(path, rel)
+            parts = rel.parts
+            if len(parts) >= 2 and parts[0] in ("images", "labels"):
+                continue
+            archive.write(path, rel)
         _write_train_files(archive, model)
-    return zip_path
+    return zip_path, kept
 
 
 def _zip_split_first_dataset(
@@ -221,6 +283,7 @@ def _zip_split_first_dataset(
     zip_path: Path,
     compress: dict[str, Any],
     model: str,
+    skip_ids: set[int],
 ) -> Path:
     zip_path = zip_path.with_suffix(".zip")
     total = 0
@@ -228,6 +291,10 @@ def _zip_split_first_dataset(
         for split_name, pairs in splits.items():
             for image_path, label_path in pairs:
                 stem = image_path.stem
+                if skip_ids:
+                    filtered = _read_label_filtered(label_path, skip_ids)
+                    if not filtered.strip():
+                        continue
                 if compress["enabled"]:
                     data = _compress_image_bytes(
                         image_path,
@@ -238,7 +305,10 @@ def _zip_split_first_dataset(
                 else:
                     ext = image_path.suffix.lower()
                     archive.write(image_path, f"{split_name}/images/{stem}{ext}")
-                archive.write(label_path, f"{split_name}/labels/{stem}.txt")
+                if skip_ids:
+                    archive.writestr(f"{split_name}/labels/{stem}.txt", filtered)
+                else:
+                    archive.write(label_path, f"{split_name}/labels/{stem}.txt")
                 total += 1
         data = {
             "path": ".",
@@ -258,8 +328,21 @@ def _zip_flat_dataset(
     zip_path: Path,
     compress: dict[str, Any],
     model: str,
+    skip_ids: set[int],
 ) -> Path:
-    indices = list(range(len(pairs)))
+    # Drop pairs whose label becomes empty after class filtering, before
+    # computing splits so train/val/test ratios stay proportional.
+    filtered_pairs: list[tuple[Path, Path, str]] = []
+    for image_path, label_path in pairs:
+        if skip_ids:
+            filtered = _read_label_filtered(label_path, skip_ids)
+            if not filtered.strip():
+                continue
+            filtered_pairs.append((image_path, label_path, filtered))
+        else:
+            filtered_pairs.append((image_path, label_path, None))
+
+    indices = list(range(len(filtered_pairs)))
     random.Random(seed).shuffle(indices)
     total = len(indices)
     train_end = round(total * float(splits["train"]))
@@ -272,7 +355,7 @@ def _zip_flat_dataset(
     zip_path = zip_path.with_suffix(".zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         counter = 1
-        for i, (image_path, label_path) in enumerate(pairs):
+        for i, (image_path, label_path, filtered) in enumerate(filtered_pairs):
             split = split_map[i]
             stem = f"{counter:06d}"
             counter += 1
@@ -286,7 +369,10 @@ def _zip_flat_dataset(
             else:
                 ext = image_path.suffix.lower()
                 archive.write(image_path, f"images/{split}/{stem}{ext}")
-            archive.write(label_path, f"labels/{split}/{stem}.txt")
+            if filtered is not None:
+                archive.writestr(f"labels/{split}/{stem}.txt", filtered)
+            else:
+                archive.write(label_path, f"labels/{split}/{stem}.txt")
 
         data = {
             "path": ".",
@@ -306,6 +392,7 @@ def format_to_train(config: dict[str, Any]) -> int:
         raise FileNotFoundError(f"output_dir does not exist: {dataset}")
     dataset = dataset.resolve()
     model = config["train"]["model"]
+    skip_ids = {int(cid) for cid in config.get("skip_classes", [])}
 
     if _is_built_dataset(dataset):
         missing = _validate_train_dataset(dataset)
@@ -313,15 +400,16 @@ def format_to_train(config: dict[str, Any]) -> int:
             raise ValueError(
                 f"Dataset is missing required artifacts for training: {', '.join(missing)}"
             )
-        zip_path = _zip_built_dataset(
+        zip_path, kept = _zip_built_dataset(
             dataset,
             dataset.parent / f"{dataset.name}_train",
             config["compress"],
             model,
+            skip_ids,
         )
         print(
-            f"Training bundle created: {zip_path} "
-            f"({zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model})"
+            f"Training bundle created: {zip_path} ({kept} images, "
+            f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model})"
         )
         return 0
 
@@ -342,6 +430,7 @@ def format_to_train(config: dict[str, Any]) -> int:
             dataset.parent / f"{dataset.name}_train",
             config["compress"],
             model,
+            skip_ids,
         )
         print(
             f"Training bundle created: {zip_path} ({total} images, "
@@ -364,9 +453,15 @@ def format_to_train(config: dict[str, Any]) -> int:
         dataset.parent / f"{dataset.name}_train",
         config["compress"],
         model,
+        skip_ids,
+    )
+    kept = sum(
+        1
+        for _, label in pairs
+        if not skip_ids or _read_label_filtered(label, skip_ids).strip()
     )
     print(
-        f"Training bundle created: {zip_path} ({len(pairs)} images, "
+        f"Training bundle created: {zip_path} ({kept} images, "
         f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model})"
     )
     return 0
