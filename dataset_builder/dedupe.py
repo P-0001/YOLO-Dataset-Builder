@@ -9,6 +9,8 @@ from typing import Any
 
 from PIL import Image
 
+from .utils import Progress, map_progress
+
 _PHASH_SIZE = 8
 _PHASH_DCT = 32
 _NUM_BLOCKS = 8
@@ -101,14 +103,19 @@ def _is_near_duplicate(
 
 
 def find_duplicates(
-    records: list[dict[str, Any]], threshold: int, workers: int = 0
+    records: list[dict[str, Any]],
+    threshold: int,
+    workers: int = 0,
+    progress: Progress | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Keep the first sorted record in each exact/near duplicate group."""
     valid = [record for record in records if not record["error"]]
     max_workers = workers or min(32, max(1, (len(valid) // 100) + 1))
     paths = [record["path"] for record in valid]
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        exact_hashes = list(executor.map(_hash_file, paths))
+        exact_hashes = map_progress(
+            executor, _hash_file, paths, progress, "Hashing files"
+        )
     groups: dict[str, list[dict[str, Any]]] = {}
     for record, digest in zip(valid, exact_hashes):
         groups.setdefault(digest, []).append(record)
@@ -131,8 +138,12 @@ def find_duplicates(
                 }
             )
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        perceptual = list(
-            executor.map(_perceptual_hash, [record["path"] for record in kept])
+        perceptual = map_progress(
+            executor,
+            _perceptual_hash,
+            [record["path"] for record in kept],
+            progress,
+            "Comparing images",
         )
     final: list[dict[str, Any]] = []
     final_hashes: list[tuple[int, tuple[int, int, int]]] = []

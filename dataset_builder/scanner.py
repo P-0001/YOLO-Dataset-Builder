@@ -6,6 +6,8 @@ from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
+from .utils import Progress, map_progress, report
+
 
 def discover_images(source: Path, extensions: list[str]) -> list[Path]:
     allowed = {extension.lower() for extension in extensions}
@@ -61,9 +63,13 @@ def _scan_one(path: Path) -> dict[str, Any]:
 
 
 def scan_images(
-    source: Path, extensions: list[str], workers: int = 0
+    source: Path,
+    extensions: list[str],
+    workers: int = 0,
+    progress: Progress | None = None,
 ) -> list[dict[str, Any]]:
+    report(progress, "Discovering images")
     paths = discover_images(source, extensions)
     max_workers = workers or min(32, max(1, (len(paths) // 100) + 1))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        return list(executor.map(_scan_one, paths))
+        return map_progress(executor, _scan_one, paths, progress, "Scanning images")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import random
 import shutil
+import sys
 import tempfile
 import zipfile
 from io import BytesIO
@@ -18,7 +19,7 @@ from .report import render_report
 from .scanner import discover_unsupported_files, scan_images
 from .splitter import split_records
 from .stats import collect_dataset_stats
-from .utils import ensure_dir, utc_now, write_csv, write_json
+from .utils import Progress, ensure_dir, report, utc_now, write_csv, write_json
 
 TRAIN_REQUIRED_ARTIFACTS = (
     "dataset.yaml",
@@ -40,22 +41,25 @@ from pathlib import Path
 
 from ultralytics import YOLO
 
+DEFAULT_MODEL = __MODEL__
+DEFAULT_EXPORT_ONNX = __EXPORT_ONNX__
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train YOLO on the bundled dataset.")
-    parser.add_argument("--model", default="__MODEL__", help="Base model weights (default: __MODEL__)")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Base model weights (default: {DEFAULT_MODEL})")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs (default: 100)")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size (default: 640)")
     parser.add_argument("--batch", type=int, default=16, help="Batch size (default: 16)")
     parser.add_argument("--device", default="0", help="CUDA device, e.g. 0 or 0,1 (default: 0)")
-    parser.add_argument("--no-export", action="store_true", help="Skip ONNX export after training")
+    parser.add_argument("--export", action=argparse.BooleanOptionalAction, default=DEFAULT_EXPORT_ONNX, help="Export best.pt to ONNX after training")
     args = parser.parse_args()
 
     data_yaml = str(Path(__file__).resolve().parent / "dataset.yaml")
     model = YOLO(args.model)
     model.train(data=data_yaml, epochs=args.epochs, imgsz=args.imgsz, batch=args.batch, device=args.device)
 
-    if not args.no_export:
+    if args.export:
         best = Path(model.trainer.save_dir) / "weights" / "best.pt"
         model.export(model=str(best), format="onnx")
         print(f"Exported ONNX: {best.with_suffix('.onnx')}")
@@ -76,7 +80,7 @@ ENTRYPOINT_SH = """\
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /workspace
+cd "$(dirname "$0")"
 
 echo "Installing Python dependencies..."
 pip install --upgrade pip
@@ -208,15 +212,53 @@ def _compress_image_bytes(image_path: Path, max_size: int, jpeg_quality: int) ->
         return buffer.getvalue()
 
 
-def _write_train_files(archive: zipfile.ZipFile, model: str) -> None:
+def _write_train_files(
+    archive: zipfile.ZipFile, model: str, export_onnx: bool = True
+) -> None:
+    model_path = Path(model).expanduser()
+    default_model = model_path.name if model_path.is_file() else model
     for name, content in _TRAIN_FILES.items():
         if name == "train.py":
-            content = content.replace("__MODEL__", model)
+            content = content.replace("__MODEL__", repr(default_model)).replace(
+                "__EXPORT_ONNX__", repr(export_onnx)
+            )
         info = zipfile.ZipInfo(name)
         info.compress_type = zipfile.ZIP_DEFLATED
         if name == "entrypoint.sh":
             info.external_attr = 0o755 << 16
         archive.writestr(info, content)
+    if model_path.is_file() and model_path.name not in archive.namelist():
+        archive.write(model_path, model_path.name)
+
+
+def _write_vastai_script(zip_path: Path) -> Path:
+    """Write the native launcher that uploads this bundle and starts it remotely."""
+    if sys.platform == "win32":
+        path = zip_path.with_suffix(".ps1")
+        content = r'''param([Parameter(Mandatory)][string]$InstanceId)
+$ErrorActionPreference = "Stop"
+$archive = [IO.Path]::ChangeExtension($PSCommandPath, ".zip")
+vastai copy "local:$archive" "${InstanceId}:/workspace/dataset_train.zip"
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
+vastai execute $InstanceId 'run_dir=/workspace/training-$(date +%Y%m%d-%H%M%S) && mkdir -p "$run_dir" && python -m zipfile -e /workspace/dataset_train.zip "$run_dir" && ln -sfn "$run_dir" /workspace/training-latest && cd "$run_dir" && nohup bash entrypoint.sh > training.log 2>&1 < /dev/null &'
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
+Write-Host "Training started. Check: vastai execute $InstanceId 'tail -f /workspace/training-latest/training.log'"
+'''
+    else:
+        path = zip_path.with_suffix(".sh")
+        content = r'''#!/usr/bin/env sh
+set -eu
+instance_id="${1:?Usage: $0 INSTANCE_ID}"
+script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
+archive="$script_dir/$(basename "${0%.*}").zip"
+vastai copy "local:$archive" "${instance_id}:/workspace/dataset_train.zip"
+vastai execute "$instance_id" 'run_dir=/workspace/training-$(date +%Y%m%d-%H%M%S) && mkdir -p "$run_dir" && python -m zipfile -e /workspace/dataset_train.zip "$run_dir" && ln -sfn "$run_dir" /workspace/training-latest && cd "$run_dir" && nohup bash entrypoint.sh > training.log 2>&1 < /dev/null &'
+echo "Training started. Check: vastai execute $instance_id 'tail -f /workspace/training-latest/training.log'"
+'''
+    path.write_text(content, encoding="utf-8")
+    if sys.platform != "win32":
+        path.chmod(path.stat().st_mode | 0o111)
+    return path
 
 
 def _zip_built_dataset(
@@ -224,45 +266,48 @@ def _zip_built_dataset(
     zip_path: Path,
     compress: dict[str, Any],
     model: str,
+    export_onnx: bool,
+    classes: list[str],
     skip_ids: set[int],
-) -> Path:
+    progress: Progress | None = None,
+) -> tuple[Path, int]:
     zip_path = zip_path.with_suffix(".zip")
     kept = 0
+    queued: list[tuple[Path, Path]] = []
+    for split in ("train", "val", "test"):
+        images_dir = dataset / "images" / split
+        labels_dir = dataset / "labels" / split
+        if not images_dir.is_dir():
+            continue
+        for image_path in sorted(images_dir.rglob("*"), key=lambda p: str(p).lower()):
+            if image_path.is_file() and image_path.suffix.lower() in _IMAGE_EXTS:
+                relative = image_path.relative_to(images_dir).with_suffix(".txt")
+                queued.append((image_path, labels_dir / relative))
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for split in ("train", "val", "test"):
-            images_dir = dataset / "images" / split
-            labels_dir = dataset / "labels" / split
-            if not images_dir.is_dir():
-                continue
-            for image_path in sorted(
-                images_dir.rglob("*"), key=lambda p: str(p).lower()
-            ):
-                if not image_path.is_file() or image_path.suffix.lower() not in _IMAGE_EXTS:
+        for done, (image_path, label_path) in enumerate(queued, start=1):
+            report(progress, "Bundling images", done, len(queued))
+            rel_img = image_path.relative_to(dataset)
+            filtered = None
+            if skip_ids and label_path.is_file():
+                filtered = _read_label_filtered(label_path, skip_ids)
+                if not filtered.strip():
                     continue
-                rel_img = image_path.relative_to(dataset)
-                label_path = labels_dir / image_path.relative_to(
-                    images_dir
-                ).with_suffix(".txt")
-                if skip_ids and label_path.is_file():
-                    filtered = _read_label_filtered(label_path, skip_ids)
-                    if not filtered.strip():
-                        continue
-                if compress["enabled"]:
-                    data = _compress_image_bytes(
-                        image_path,
-                        int(compress["max_size"]),
-                        int(compress["jpeg_quality"]),
-                    )
-                    archive.writestr(rel_img.with_suffix(".jpg"), data)
+            if compress["enabled"]:
+                data = _compress_image_bytes(
+                    image_path,
+                    int(compress["max_size"]),
+                    int(compress["jpeg_quality"]),
+                )
+                archive.writestr(rel_img.with_suffix(".jpg").as_posix(), data)
+            else:
+                archive.write(image_path, rel_img)
+            if label_path.is_file():
+                rel_lbl = label_path.relative_to(dataset)
+                if filtered is not None:
+                    archive.writestr(rel_lbl.as_posix(), filtered)
                 else:
-                    archive.write(image_path, rel_img)
-                if label_path.is_file():
-                    rel_lbl = label_path.relative_to(dataset)
-                    if skip_ids:
-                        archive.writestr(rel_lbl, filtered)
-                    else:
-                        archive.write(label_path, rel_lbl)
-                kept += 1
+                    archive.write(label_path, rel_lbl)
+            kept += 1
         # Non-image/label artifacts (dataset.yaml, reports, configs).
         for path in dataset.rglob("*"):
             if not path.is_file():
@@ -271,8 +316,15 @@ def _zip_built_dataset(
             parts = rel.parts
             if len(parts) >= 2 and parts[0] in ("images", "labels"):
                 continue
+            if rel.as_posix() == "dataset.yaml":
+                continue
             archive.write(path, rel)
-        _write_train_files(archive, model)
+        data = _read_dataset_yaml(dataset) or {}
+        data["path"] = "."
+        if classes:
+            data["names"] = {index: name for index, name in enumerate(classes)}
+        archive.writestr("dataset.yaml", yaml.safe_dump(data, sort_keys=False))
+        _write_train_files(archive, model, export_onnx)
     return zip_path, kept
 
 
@@ -283,13 +335,19 @@ def _zip_split_first_dataset(
     zip_path: Path,
     compress: dict[str, Any],
     model: str,
+    export_onnx: bool,
     skip_ids: set[int],
-) -> Path:
+    progress: Progress | None = None,
+) -> tuple[Path, int]:
     zip_path = zip_path.with_suffix(".zip")
     total = 0
+    queued = sum(len(pairs) for pairs in splits.values())
+    done = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for split_name, pairs in splits.items():
             for image_path, label_path in pairs:
+                done += 1
+                report(progress, "Bundling images", done, queued)
                 stem = image_path.stem
                 if skip_ids:
                     filtered = _read_label_filtered(label_path, skip_ids)
@@ -316,7 +374,7 @@ def _zip_split_first_dataset(
             "names": {index: name for index, name in enumerate(classes)},
         }
         archive.writestr("dataset.yaml", yaml.safe_dump(data, sort_keys=False))
-        _write_train_files(archive, model)
+        _write_train_files(archive, model, export_onnx)
     return zip_path, total
 
 
@@ -328,7 +386,9 @@ def _zip_flat_dataset(
     zip_path: Path,
     compress: dict[str, Any],
     model: str,
+    export_onnx: bool,
     skip_ids: set[int],
+    progress: Progress | None = None,
 ) -> Path:
     # Drop pairs whose label becomes empty after class filtering, before
     # computing splits so train/val/test ratios stay proportional.
@@ -356,6 +416,7 @@ def _zip_flat_dataset(
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         counter = 1
         for i, (image_path, label_path, filtered) in enumerate(filtered_pairs):
+            report(progress, "Bundling images", i + 1, len(filtered_pairs))
             split = split_map[i]
             stem = f"{counter:06d}"
             counter += 1
@@ -382,17 +443,20 @@ def _zip_flat_dataset(
             "names": {index: name for index, name in enumerate(classes)},
         }
         archive.writestr("dataset.yaml", yaml.safe_dump(data, sort_keys=False))
-        _write_train_files(archive, model)
+        _write_train_files(archive, model, export_onnx)
     return zip_path
 
 
-def format_to_train(config: dict[str, Any]) -> int:
+def format_to_train(config: dict[str, Any], progress: Progress | None = None) -> int:
     dataset = Path(config["output_dir"])
     if not dataset.is_dir():
         raise FileNotFoundError(f"output_dir does not exist: {dataset}")
     dataset = dataset.resolve()
     model = config["train"]["model"]
+    export_onnx = config["train"].get("export_onnx", True)
+    chosen_classes = config["train"].get("classes", [])
     skip_ids = {int(cid) for cid in config.get("skip_classes", [])}
+    report(progress, "Inspecting dataset")
 
     if _is_built_dataset(dataset):
         missing = _validate_train_dataset(dataset)
@@ -405,18 +469,25 @@ def format_to_train(config: dict[str, Any]) -> int:
             dataset.parent / f"{dataset.name}_train",
             config["compress"],
             model,
+            export_onnx,
+            chosen_classes,
             skip_ids,
+            progress,
         )
+        script_path = _write_vastai_script(zip_path)
         print(
             f"Training bundle created: {zip_path} ({kept} images, "
-            f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model})"
+            f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model}); "
+            f"Vast.ai launcher: {script_path}"
         )
         return 0
 
     split_first = _discover_split_first(dataset)
     if split_first:
         existing = _read_dataset_yaml(dataset)
-        if existing and isinstance(existing.get("names"), list):
+        if chosen_classes:
+            classes = chosen_classes
+        elif existing and isinstance(existing.get("names"), list):
             classes = existing["names"]
         elif existing and isinstance(existing.get("names"), dict):
             classes = [existing["names"][i] for i in sorted(existing["names"])]
@@ -430,11 +501,15 @@ def format_to_train(config: dict[str, Any]) -> int:
             dataset.parent / f"{dataset.name}_train",
             config["compress"],
             model,
+            export_onnx,
             skip_ids,
+            progress,
         )
+        script_path = _write_vastai_script(zip_path)
         print(
             f"Training bundle created: {zip_path} ({total} images, "
-            f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model})"
+            f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model}); "
+            f"Vast.ai launcher: {script_path}"
         )
         return 0
 
@@ -444,7 +519,7 @@ def format_to_train(config: dict[str, Any]) -> int:
             f"No paired image+label files found in {dataset}. "
             "Expected images with sibling .txt label files."
         )
-    classes = _detect_classes([label for _, label in pairs])
+    classes = chosen_classes or _detect_classes([label for _, label in pairs])
     zip_path = _zip_flat_dataset(
         pairs,
         classes,
@@ -453,8 +528,11 @@ def format_to_train(config: dict[str, Any]) -> int:
         dataset.parent / f"{dataset.name}_train",
         config["compress"],
         model,
+        export_onnx,
         skip_ids,
+        progress,
     )
+    script_path = _write_vastai_script(zip_path)
     kept = sum(
         1
         for _, label in pairs
@@ -462,7 +540,8 @@ def format_to_train(config: dict[str, Any]) -> int:
     )
     print(
         f"Training bundle created: {zip_path} ({kept} images, "
-        f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model})"
+        f"{zip_path.stat().st_size / (1024 * 1024):.1f} MB, model={model}); "
+        f"Vast.ai launcher: {script_path}"
     )
     return 0
 
@@ -498,7 +577,7 @@ def write_dataset_yaml(
     )
 
 
-def build(config: dict[str, Any]) -> int:
+def build(config: dict[str, Any], progress: Progress | None = None) -> int:
     source, output = Path(config["source_dir"]), Path(config["output_dir"])
     if not source.is_dir():
         raise FileNotFoundError(f"source_dir does not exist: {source}")
@@ -514,17 +593,24 @@ def build(config: dict[str, Any]) -> int:
     ensure_dir(output.parent)
     staging = Path(tempfile.mkdtemp(prefix=f"{output.name}-build-"))
     try:
-        records = scan_images(source, config["extensions"], config["workers"])
+        records = scan_images(
+            source, config["extensions"], config["workers"], progress
+        )
         clean, duplicates = find_duplicates(
-            records, int(config["near_duplicate_threshold"]), config["workers"]
+            records,
+            int(config["near_duplicate_threshold"]),
+            config["workers"],
+            progress,
         )
         split_data = split_records(clean, config["splits"], int(config["seed"]))
         for split in split_data:
             ensure_dir(staging / "images" / split)
             ensure_dir(staging / "labels" / split)
         name = 1
+        to_copy = sum(len(items) for items in split_data.values())
         for split, items in split_data.items():
             for record in items:
+                report(progress, "Copying images", name, to_copy)
                 source_image = record["path"]
                 destination = (
                     staging
@@ -552,6 +638,7 @@ def build(config: dict[str, Any]) -> int:
             {"path": str(path), "flags": "unsupported format"}
             for path in discover_unsupported_files(source, config["extensions"])
         )
+        report(progress, "Writing reports")
         ensure_dir(staging / "reports")
         write_csv(
             staging / "reports" / "duplicates.csv",
@@ -608,10 +695,11 @@ def build(config: dict[str, Any]) -> int:
     return 0
 
 
-def verify(config: dict[str, Any]) -> int:
+def verify(config: dict[str, Any], progress: Progress | None = None) -> int:
     output = Path(config["output_dir"])
     if not output.is_dir():
         raise FileNotFoundError(f"output_dir does not exist: {output}")
+    report(progress, "Verifying dataset")
     stats = collect_dataset_stats(output, config)
     write_json(output / "reports" / "stats.json", stats)
     render_report(output / "reports" / "report.html", stats)
@@ -628,10 +716,11 @@ def verify(config: dict[str, Any]) -> int:
     return 1 if problems else 0
 
 
-def stats(config: dict[str, Any]) -> int:
+def stats(config: dict[str, Any], progress: Progress | None = None) -> int:
     output = Path(config["output_dir"])
     if not output.is_dir():
         raise FileNotFoundError(f"output_dir does not exist: {output}")
+    report(progress, "Collecting statistics")
     data = collect_dataset_stats(output, config)
     write_json(output / "reports" / "stats.json", data)
     render_report(output / "reports" / "report.html", data)
