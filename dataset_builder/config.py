@@ -23,7 +23,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_size": 1280,
         "jpeg_quality": 85,
     },
-    "train": {"model": "yolo11m.pt", "classes": [], "export_onnx": True},
+    "train": {
+        "model": "yolo11m.pt",
+        "classes": [],
+        "epochs": 100,
+        "imgsz": 640,
+        "batch": 16,
+        "device": "0",
+        "export_onnx": True,
+    },
     "vastai": {"instance_id": ""},
 }
 
@@ -111,6 +119,11 @@ def validate_config(config: dict[str, Any]) -> None:
         isinstance(name, str) and name.strip() for name in train_classes
     ):
         raise ValueError("train.classes must be a list of non-empty names.")
+    for key in ("epochs", "imgsz", "batch"):
+        if not isinstance(train[key], int) or train[key] < 1:
+            raise ValueError(f"train.{key} must be a positive integer.")
+    if not isinstance(train["device"], str) or not train["device"].strip():
+        raise ValueError("train.device must be a non-empty string (e.g. 0, 0,1, cpu).")
     instance_id = config.get("vastai", {}).get("instance_id", "")
     if not isinstance(instance_id, str) or (instance_id and not instance_id.isdigit()):
         raise ValueError("vastai.instance_id must be blank or a numeric instance ID.")

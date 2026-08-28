@@ -264,6 +264,17 @@ FIELDS: tuple[Field, ...] = (
         fmt=join,
         hint="Comma-separated in class-ID order. Blank preserves or auto-detects names.",
     ),
+    Field("epochs", "Epochs", ("train", "epochs"), integer(1), group="training", width=7),
+    Field("imgsz", "Image size", ("train", "imgsz"), integer(1), group="training", width=7),
+    Field("batch", "Batch", ("train", "batch"), integer(1), group="training", width=7),
+    Field(
+        "device",
+        "Device",
+        ("train", "device"),
+        text("Enter a device, e.g. 0, 0,1, or cpu"),
+        group="training",
+        width=7,
+    ),
     Field(
         "export_onnx",
         "Export best model to ONNX after training",
@@ -320,6 +331,12 @@ GROUPS: tuple[Group, ...] = (
         "Quality",
         "Images outside these limits are flagged in quality_flags.csv.",
         ("min_width", "min_height", "max_aspect_ratio"),
+    ),
+    Group(
+        "training",
+        "Training",
+        "Defaults passed to train.py; every value remains overridable on the command line.",
+        ("epochs", "imgsz", "batch", "device"),
     ),
     Group(
         "compress",

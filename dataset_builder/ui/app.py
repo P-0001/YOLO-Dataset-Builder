@@ -15,6 +15,7 @@ import threading
 import time
 import webbrowser
 from collections.abc import Callable
+from datetime import timedelta
 from pathlib import Path
 from tkinter import (
     BooleanVar,
@@ -42,6 +43,9 @@ LEGACY_PREFERENCES = Path(__file__).resolve().parents[2] / ".dataset_builder_gui
 LOG_LIMIT = 2000  # lines retained in the activity log
 POLL_MS = 100
 DOCK_HEIGHT = 140  # compact by default; the sash is still draggable
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 960
+DISPLAY_FRACTION = 0.96
 
 REQUIRED_OUTPUT_ARTIFACTS = (
     "build_config.yaml",
@@ -92,8 +96,8 @@ class DatasetBuilderGui:
         self.root = root
         root.title("YOLO Dataset Builder")
         screen_width, screen_height = root.winfo_screenwidth(), root.winfo_screenheight()
-        width = max(1, min(1180, round(screen_width * 0.9)))
-        height = max(1, min(900, round(screen_height * 0.95)))
+        width = max(1, min(WINDOW_WIDTH, round(screen_width * DISPLAY_FRACTION)))
+        height = max(1, min(WINDOW_HEIGHT, round(screen_height * DISPLAY_FRACTION)))
         root.geometry(f"{width}x{height}")
         root.minsize(min(820, width), min(620, height))
         self._initial_size = (width, height)
@@ -127,6 +131,10 @@ class DatasetBuilderGui:
         self._estimate_token = 0
         self._progress_state: tuple[str, int, int] = ("", 0, 0)
         self._shown_progress: tuple[str, int, int] | None = None
+        self._phase_started_at = 0.0
+        self._phase_start_done = 0
+        self._logged_phase = ""
+        self._logged_progress = -1
         self._bar_mode = ""
         self._output: queue.Queue[str] = queue.Queue()
         # Written by background threads, consumed by _poll on the main thread.
@@ -192,8 +200,12 @@ class DatasetBuilderGui:
         initial = getattr(self, "_initial_size", None)
         saved_width = int(match.group(1)) if match else initial[0]
         saved_height = int(match.group(2)) if match else initial[1]
-        width = min(saved_width, 1180, max(1, round(screen_width * 0.9)))
-        height = min(saved_height, 900, max(1, round(screen_height * 0.95)))
+        width = min(
+            saved_width, WINDOW_WIDTH, max(1, round(screen_width * DISPLAY_FRACTION))
+        )
+        height = min(
+            saved_height, WINDOW_HEIGHT, max(1, round(screen_height * DISPLAY_FRACTION))
+        )
         saved_x = int(match.group(3)) if match else self.root.winfo_x()
         saved_y = int(match.group(4)) if match else self.root.winfo_y()
         x = min(max(0, saved_x), screen_width - width)
@@ -338,6 +350,7 @@ class DatasetBuilderGui:
         model.grid(row=1, column=0, padx=(0, theme.PAD_S), **pad)
         self._entry_row(model, "train_model", button=("Browse", self._pick_model))
         self._entry_row(model, "train_classes")
+        self._group_row(model, fields.GROUP_BY_NAME["training"])
         self._entry_row(model, "vastai_instance")
 
         bundle = Card(body, "Bundle options", "Compression and class filtering.")
@@ -756,8 +769,36 @@ class DatasetBuilderGui:
         self._started_at = time.monotonic()
         self._progress_state = (label, 0, 0)
         self._shown_progress = None
+        self._phase_started_at = self._started_at
+        self._phase_start_done = 0
+        self._logged_phase = ""
+        self._logged_progress = -1
         self.set_status(f"{label}…", "busy")
         self.log_line(f"{label} started.", "info")
+        input_path = config["source_dir"] if name == "build" else config["output_dir"]
+        self.log_line(f"Input: {input_path}", "info")
+        if name == "build":
+            self.log_line(
+                f"Output: {config['output_dir']} · workers: {config['workers'] or 'auto'}",
+                "info",
+            )
+        elif name == "export":
+            train = config["train"]
+            compression = config["compress"]
+            self.log_line(
+                f"Training: {train['model']} · {train['epochs']} epochs · "
+                f"imgsz {train['imgsz']} · batch {train['batch']} · device {train['device']}",
+                "info",
+            )
+            self.log_line(
+                "Compression: "
+                + (
+                    f"{compression['max_size']}px / JPEG {compression['jpeg_quality']}"
+                    if compression["enabled"]
+                    else "off"
+                ),
+                "info",
+            )
 
         def worker() -> None:
             stream = LineStream(self._output)
@@ -824,7 +865,19 @@ class DatasetBuilderGui:
 
     def _report(self, phase: str, done: int, total: int) -> None:
         """Called from the worker thread; the poller renders it on the UI thread."""
+        if phase != self._progress_state[0]:
+            self._phase_started_at = time.monotonic()
+            self._phase_start_done = max(0, done - 1)
         self._progress_state = (phase, done, total)
+
+    def _remaining(self) -> str:
+        _, done, total = self._progress_state
+        progressed = done - self._phase_start_done
+        phase_elapsed = time.monotonic() - self._phase_started_at
+        if total <= done or progressed <= 0 or phase_elapsed < 0.5:
+            return ""
+        seconds = max(1, round(phase_elapsed * (total - done) / progressed))
+        return str(timedelta(seconds=seconds))
 
     def _drain(self) -> None:
         while True:
@@ -847,7 +900,11 @@ class DatasetBuilderGui:
                 break
         if self._running:
             self._render_progress()
-            self.elapsed.set(f"{time.monotonic() - self._started_at:.0f}s")
+            elapsed = f"{time.monotonic() - self._started_at:.0f}s elapsed"
+            remaining = self._remaining()
+            self.elapsed.set(
+                f"{elapsed} · ~{remaining} left" if remaining else elapsed
+            )
         outcome, self._outcome = self._outcome, None
         if outcome is not None:
             self._render_progress()
@@ -865,6 +922,13 @@ class DatasetBuilderGui:
             return
         self._shown_progress = state
         phase, done, total = state
+        if phase != self._logged_phase:
+            self._logged_phase = phase
+            self._logged_progress = 0
+            self.log_line(
+                f"{phase} started" + (f" ({total:,} items)." if total else "."),
+                "info",
+            )
         if total > 0:
             if self._bar_mode != "determinate":
                 self.progress.stop()
@@ -872,6 +936,15 @@ class DatasetBuilderGui:
                 self._bar_mode = "determinate"
             self.progress.configure(maximum=total, value=done)
             self.set_status(f"{phase} {done:,}/{total:,}", "busy")
+            milestone = min(10, done * 10 // total)
+            if milestone > self._logged_progress:
+                self._logged_progress = milestone
+                remaining = self._remaining()
+                self.log_line(
+                    f"{phase}: {done:,}/{total:,} ({done / total:.0%})"
+                    + (f" · ~{remaining} left" if remaining else ""),
+                    "output",
+                )
         else:
             if self._bar_mode != "indeterminate":
                 self.progress.configure(mode="indeterminate")

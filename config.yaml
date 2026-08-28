@@ -17,6 +17,16 @@ splits:
 seed: 42
 create_empty_labels: true
 near_duplicate_threshold: 4
+skip_classes: []
+
+extensions:
+  - .jpg
+  - .jpeg
+  - .png
+  - .webp
+  - .bmp
+  - .tif
+  - .tiff
 
 # Set to a positive number to limit concurrent image checks; 0 chooses automatically.
 workers: 0
@@ -40,3 +50,13 @@ compress:
 # via `python train.py --model <weights>`.
 train:
   model: yolo11m.pt
+  classes: []
+  epochs: 100
+  imgsz: 640
+  batch: 16
+  device: "0"
+  export_onnx: true
+
+# Optional Vast.ai instance ID used by the GUI after export.
+vastai:
+  instance_id: ""

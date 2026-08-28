@@ -1,16 +1,22 @@
 import io
 import queue
 import tempfile
+import time
 import unittest
 import zipfile
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+from PIL import Image
+
 from dataset_builder import builder
 from dataset_builder.builder import _write_train_files, _write_vastai_script
+from dataset_builder.config import DEFAULT_CONFIG, validate_config
 from dataset_builder.ui import app as app_module
 from dataset_builder.ui.app import DatasetBuilderGui
-from dataset_builder.ui.fields import number
+from dataset_builder.ui.fields import FIELDS, lookup, number
 
 
 class Value:
@@ -85,7 +91,22 @@ class ReviewFixesTest(unittest.TestCase):
 
         app._fit_to_display()
 
-        self.assertEqual(app.root.value, "1180x900+0+180")
+        self.assertEqual(app.root.value, "1280x960+0+120")
+
+    def test_progress_estimates_time_remaining(self):
+        app = DatasetBuilderGui.__new__(DatasetBuilderGui)
+        app._progress_state = ("Bundling images", 50, 100)
+        app._phase_start_done = 0
+        app._phase_started_at = time.monotonic() - 10
+
+        self.assertEqual(app._remaining(), "0:00:10")
+
+    def test_sample_yaml_contains_every_ui_setting(self):
+        sample = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
+        validate_config(sample)
+        for spec in FIELDS:
+            with self.subTest(field=spec.name):
+                lookup(sample, spec.path)
 
     def test_local_model_and_native_vastai_launcher_are_exported(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,20 +115,36 @@ class ReviewFixesTest(unittest.TestCase):
             model.write_bytes(b"weights")
             bundle = root / "dataset_train.zip"
             with zipfile.ZipFile(bundle, "w") as archive:
-                _write_train_files(archive, str(model))
+                train = {
+                    "model": str(model),
+                    "classes": [],
+                    "epochs": 25,
+                    "imgsz": 960,
+                    "batch": 8,
+                    "device": "0,1",
+                    "export_onnx": True,
+                }
+                _write_train_files(archive, train)
 
             with zipfile.ZipFile(bundle) as archive:
                 self.assertEqual(archive.read("base.pt"), b"weights")
                 trainer = archive.read("train.py").decode()
-                self.assertIn("DEFAULT_MODEL = 'base.pt'", trainer)
-                self.assertIn("DEFAULT_EXPORT_ONNX = True", trainer)
+                compile(trainer, "train.py", "exec")
+                self.assertIn("'model': 'base.pt'", trainer)
+                self.assertIn("'epochs': 25", trainer)
+                self.assertIn("'imgsz': 960", trainer)
+                self.assertIn("'batch': 8", trainer)
+                self.assertIn("'device': '0,1'", trainer)
+                self.assertIn("'export_onnx': True", trainer)
 
             without_onnx = root / "without_onnx.zip"
             with zipfile.ZipFile(without_onnx, "w") as archive:
-                _write_train_files(archive, "yolo11m.pt", False)
+                train["model"] = "yolo11m.pt"
+                train["export_onnx"] = False
+                _write_train_files(archive, train)
             with zipfile.ZipFile(without_onnx) as archive:
                 self.assertIn(
-                    "DEFAULT_EXPORT_ONNX = False",
+                    "'export_onnx': False",
                     archive.read("train.py").decode(),
                 )
 
@@ -170,16 +207,68 @@ class ReviewFixesTest(unittest.TestCase):
                 dataset,
                 dataset.parent / "dataset_train",
                 {"enabled": False, "max_size": 1280, "jpeg_quality": 85},
-                "yolo11m.pt",
-                True,
+                {
+                    "model": "yolo11m.pt",
+                    "classes": [],
+                    "epochs": 100,
+                    "imgsz": 640,
+                    "batch": 16,
+                    "device": "0",
+                    "export_onnx": True,
+                },
                 ["cat", "dog"],
                 set(),
+                0,
             )
 
             with zipfile.ZipFile(bundle) as archive:
                 exported = builder.yaml.safe_load(archive.read("dataset.yaml"))
             self.assertEqual(exported["path"], ".")
             self.assertEqual(exported["names"], {0: "cat", 1: "dog"})
+
+    def test_flat_export_uses_training_defaults_and_stores_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = Path(directory) / "flat"
+            dataset.mkdir()
+            for index in range(3):
+                image = dataset / f"image-{index}.png"
+                Image.new("RGB", (32, 32), (index * 20, 0, 0)).save(image)
+                image.with_suffix(".txt").write_text(
+                    "0 0.5 0.5 0.5 0.5\n", encoding="utf-8"
+                )
+            config = deepcopy(DEFAULT_CONFIG)
+            config["output_dir"] = str(dataset)
+            config["workers"] = 2
+            config["train"].update(
+                {"epochs": 7, "imgsz": 320, "batch": 4, "device": "cpu"}
+            )
+            phases = []
+
+            self.assertEqual(
+                builder.format_to_train(
+                    config, lambda phase, done, total: phases.append((phase, done, total))
+                ),
+                0,
+            )
+
+            with zipfile.ZipFile(dataset.parent / "flat_train.zip") as archive:
+                trainer = archive.read("train.py").decode()
+                images = [
+                    info
+                    for info in archive.infolist()
+                    if info.filename.startswith("images/")
+                ]
+            self.assertIn("'epochs': 7", trainer)
+            self.assertIn("'imgsz': 320", trainer)
+            self.assertIn("'batch': 4", trainer)
+            self.assertIn("'device': 'cpu'", trainer)
+            self.assertTrue(images)
+            self.assertTrue(
+                all(info.compress_type == zipfile.ZIP_STORED for info in images)
+            )
+            self.assertTrue(
+                any(phase == "Compressing and bundling images" for phase, _, _ in phases)
+            )
 
 
 if __name__ == "__main__":

@@ -52,9 +52,11 @@ In the GUI, enter the optional Vast.ai instance ID on the Export page. When you 
 
 The optional Export **Class names** field accepts comma-separated names in class-ID order. Leave it blank to preserve names from `dataset.yaml` or auto-detect generic names from label IDs.
 
+The Export page also sets the bundled defaults for epochs, image size, batch size, and device. Those values are saved in YAML and remain overridable with the matching `train.py` command-line options.
+
 ## Desktop GUI
 
-`gui.py` is a thin entry point for `dataset_builder.ui`, a dark-theme interface with Build, Verify, Statistics, and Format to Train workflows. It shows live progress and streams each command's output into an activity log, so the same messages the CLI prints appear in the window.
+`gui.py` is a thin entry point for `dataset_builder.ui`, a dark-theme interface with Build, Verify, Statistics, and Format to Train workflows. It shows live progress, estimated time remaining, phase milestones, and command details in the activity log.
 
 Features: compact no-scroll forms, inline validation, a build confirmation dialog, saved/loadable YAML settings, persistent local preferences, a random-seed control, an image-count estimate for the selected source folder, and a draggable split between the form and the activity log. Folder drag-and-drop is enabled when `tkinterdnd2` is installed; Browse buttons work everywhere.
 

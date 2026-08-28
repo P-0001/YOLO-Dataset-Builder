@@ -6,6 +6,9 @@ import shutil
 import sys
 import tempfile
 import zipfile
+from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -41,18 +44,20 @@ from pathlib import Path
 
 from ultralytics import YOLO
 
-DEFAULT_MODEL = __MODEL__
-DEFAULT_EXPORT_ONNX = __EXPORT_ONNX__
+DEFAULTS = __TRAIN_CONFIG__
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Train YOLO on the bundled dataset.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Base model weights (default: {DEFAULT_MODEL})")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs (default: 100)")
-    parser.add_argument("--imgsz", type=int, default=640, help="Image size (default: 640)")
-    parser.add_argument("--batch", type=int, default=16, help="Batch size (default: 16)")
-    parser.add_argument("--device", default="0", help="CUDA device, e.g. 0 or 0,1 (default: 0)")
-    parser.add_argument("--export", action=argparse.BooleanOptionalAction, default=DEFAULT_EXPORT_ONNX, help="Export best.pt to ONNX after training")
+    parser = argparse.ArgumentParser(
+        description="Train YOLO on the bundled dataset.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--model", default=DEFAULTS["model"], help="Base model weights")
+    parser.add_argument("--epochs", type=int, default=DEFAULTS["epochs"], help="Number of training epochs")
+    parser.add_argument("--imgsz", type=int, default=DEFAULTS["imgsz"], help="Image size")
+    parser.add_argument("--batch", type=int, default=DEFAULTS["batch"], help="Batch size")
+    parser.add_argument("--device", default=DEFAULTS["device"], help="CUDA device, e.g. 0 or 0,1")
+    parser.add_argument("--export", action=argparse.BooleanOptionalAction, default=DEFAULTS["export_onnx"], help="Export best.pt to ONNX after training")
     args = parser.parse_args()
 
     data_yaml = str(Path(__file__).resolve().parent / "dataset.yaml")
@@ -208,20 +213,33 @@ def _compress_image_bytes(image_path: Path, max_size: int, jpeg_quality: int) ->
             new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
             image = image.resize(new_size, Image.LANCZOS)
         buffer = BytesIO()
-        image.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
+        image.save(buffer, format="JPEG", quality=jpeg_quality)
         return buffer.getvalue()
 
 
-def _write_train_files(
-    archive: zipfile.ZipFile, model: str, export_onnx: bool = True
-) -> None:
-    model_path = Path(model).expanduser()
-    default_model = model_path.name if model_path.is_file() else model
+def _image_payloads(
+    paths: Sequence[Path], compress: dict[str, Any], workers: int
+) -> Iterator[bytes | None]:
+    if not compress["enabled"]:
+        yield from (None for _ in paths)
+        return
+    max_workers = workers or min(32, max(1, (len(paths) // 25) + 1))
+    encode = partial(
+        _compress_image_bytes,
+        max_size=int(compress["max_size"]),
+        jpeg_quality=int(compress["jpeg_quality"]),
+    )
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        yield from executor.map(encode, paths)
+
+
+def _write_train_files(archive: zipfile.ZipFile, train: dict[str, Any]) -> None:
+    defaults = dict(train)
+    model_path = Path(defaults["model"]).expanduser()
+    defaults["model"] = model_path.name if model_path.is_file() else defaults["model"]
     for name, content in _TRAIN_FILES.items():
         if name == "train.py":
-            content = content.replace("__MODEL__", repr(default_model)).replace(
-                "__EXPORT_ONNX__", repr(export_onnx)
-            )
+            content = content.replace("__TRAIN_CONFIG__", repr(defaults))
         info = zipfile.ZipInfo(name)
         info.compress_type = zipfile.ZIP_DEFLATED
         if name == "entrypoint.sh":
@@ -265,10 +283,10 @@ def _zip_built_dataset(
     dataset: Path,
     zip_path: Path,
     compress: dict[str, Any],
-    model: str,
-    export_onnx: bool,
+    train: dict[str, Any],
     classes: list[str],
     skip_ids: set[int],
+    workers: int,
     progress: Progress | None = None,
 ) -> tuple[Path, int]:
     zip_path = zip_path.with_suffix(".zip")
@@ -283,24 +301,21 @@ def _zip_built_dataset(
             if image_path.is_file() and image_path.suffix.lower() in _IMAGE_EXTS:
                 relative = image_path.relative_to(images_dir).with_suffix(".txt")
                 queued.append((image_path, labels_dir / relative))
+    prepared: list[tuple[Path, Path, str | None]] = []
+    for image_path, label_path in queued:
+        filtered = _read_label_filtered(label_path, skip_ids) if skip_ids and label_path.is_file() else None
+        if filtered is None or filtered.strip():
+            prepared.append((image_path, label_path, filtered))
+    phase = "Compressing and bundling images" if compress["enabled"] else "Bundling images"
+    payloads = _image_payloads([item[0] for item in prepared], compress, workers)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for done, (image_path, label_path) in enumerate(queued, start=1):
-            report(progress, "Bundling images", done, len(queued))
+        for done, ((image_path, label_path, filtered), data) in enumerate(zip(prepared, payloads), start=1):
+            report(progress, phase, done, len(prepared))
             rel_img = image_path.relative_to(dataset)
-            filtered = None
-            if skip_ids and label_path.is_file():
-                filtered = _read_label_filtered(label_path, skip_ids)
-                if not filtered.strip():
-                    continue
-            if compress["enabled"]:
-                data = _compress_image_bytes(
-                    image_path,
-                    int(compress["max_size"]),
-                    int(compress["jpeg_quality"]),
-                )
-                archive.writestr(rel_img.with_suffix(".jpg").as_posix(), data)
+            if data is not None:
+                archive.writestr(rel_img.with_suffix(".jpg").as_posix(), data, compress_type=zipfile.ZIP_STORED)
             else:
-                archive.write(image_path, rel_img)
+                archive.write(image_path, rel_img, compress_type=zipfile.ZIP_STORED)
             if label_path.is_file():
                 rel_lbl = label_path.relative_to(dataset)
                 if filtered is not None:
@@ -324,7 +339,7 @@ def _zip_built_dataset(
         if classes:
             data["names"] = {index: name for index, name in enumerate(classes)}
         archive.writestr("dataset.yaml", yaml.safe_dump(data, sort_keys=False))
-        _write_train_files(archive, model, export_onnx)
+        _write_train_files(archive, train)
     return zip_path, kept
 
 
@@ -334,48 +349,41 @@ def _zip_split_first_dataset(
     classes: list[str],
     zip_path: Path,
     compress: dict[str, Any],
-    model: str,
-    export_onnx: bool,
+    train: dict[str, Any],
     skip_ids: set[int],
+    workers: int,
     progress: Progress | None = None,
 ) -> tuple[Path, int]:
     zip_path = zip_path.with_suffix(".zip")
-    total = 0
-    queued = sum(len(pairs) for pairs in splits.values())
-    done = 0
+    prepared: list[tuple[str, Path, Path, str | None]] = []
+    for split_name, pairs in splits.items():
+        for image_path, label_path in pairs:
+            filtered = _read_label_filtered(label_path, skip_ids) if skip_ids else None
+            if filtered is None or filtered.strip():
+                prepared.append((split_name, image_path, label_path, filtered))
+    phase = "Compressing and bundling images" if compress["enabled"] else "Bundling images"
+    payloads = _image_payloads([item[1] for item in prepared], compress, workers)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for split_name, pairs in splits.items():
-            for image_path, label_path in pairs:
-                done += 1
-                report(progress, "Bundling images", done, queued)
-                stem = image_path.stem
-                if skip_ids:
-                    filtered = _read_label_filtered(label_path, skip_ids)
-                    if not filtered.strip():
-                        continue
-                if compress["enabled"]:
-                    data = _compress_image_bytes(
-                        image_path,
-                        int(compress["max_size"]),
-                        int(compress["jpeg_quality"]),
-                    )
-                    archive.writestr(f"{split_name}/images/{stem}.jpg", data)
-                else:
-                    ext = image_path.suffix.lower()
-                    archive.write(image_path, f"{split_name}/images/{stem}{ext}")
-                if skip_ids:
-                    archive.writestr(f"{split_name}/labels/{stem}.txt", filtered)
-                else:
-                    archive.write(label_path, f"{split_name}/labels/{stem}.txt")
-                total += 1
+        for done, ((split_name, image_path, label_path, filtered), data) in enumerate(zip(prepared, payloads), start=1):
+            report(progress, phase, done, len(prepared))
+            stem = image_path.stem
+            if data is not None:
+                archive.writestr(f"{split_name}/images/{stem}.jpg", data, compress_type=zipfile.ZIP_STORED)
+            else:
+                ext = image_path.suffix.lower()
+                archive.write(image_path, f"{split_name}/images/{stem}{ext}", compress_type=zipfile.ZIP_STORED)
+            if filtered is not None:
+                archive.writestr(f"{split_name}/labels/{stem}.txt", filtered)
+            else:
+                archive.write(label_path, f"{split_name}/labels/{stem}.txt")
         data = {
             "path": ".",
             **{name: f"{name}/images" for name in splits},
             "names": {index: name for index, name in enumerate(classes)},
         }
         archive.writestr("dataset.yaml", yaml.safe_dump(data, sort_keys=False))
-        _write_train_files(archive, model, export_onnx)
-    return zip_path, total
+        _write_train_files(archive, train)
+    return zip_path, len(prepared)
 
 
 def _zip_flat_dataset(
@@ -385,14 +393,14 @@ def _zip_flat_dataset(
     seed: int,
     zip_path: Path,
     compress: dict[str, Any],
-    model: str,
-    export_onnx: bool,
+    train: dict[str, Any],
     skip_ids: set[int],
+    workers: int,
     progress: Progress | None = None,
 ) -> Path:
     # Drop pairs whose label becomes empty after class filtering, before
     # computing splits so train/val/test ratios stay proportional.
-    filtered_pairs: list[tuple[Path, Path, str]] = []
+    filtered_pairs: list[tuple[Path, Path, str | None]] = []
     for image_path, label_path in pairs:
         if skip_ids:
             filtered = _read_label_filtered(label_path, skip_ids)
@@ -413,23 +421,20 @@ def _zip_flat_dataset(
     split_map.update(dict.fromkeys(indices[val_end:], "test"))
 
     zip_path = zip_path.with_suffix(".zip")
+    phase = "Compressing and bundling images" if compress["enabled"] else "Bundling images"
+    payloads = _image_payloads([item[0] for item in filtered_pairs], compress, workers)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         counter = 1
-        for i, (image_path, label_path, filtered) in enumerate(filtered_pairs):
-            report(progress, "Bundling images", i + 1, len(filtered_pairs))
+        for i, ((image_path, label_path, filtered), data) in enumerate(zip(filtered_pairs, payloads)):
+            report(progress, phase, i + 1, len(filtered_pairs))
             split = split_map[i]
             stem = f"{counter:06d}"
             counter += 1
-            if compress["enabled"]:
-                data = _compress_image_bytes(
-                    image_path,
-                    int(compress["max_size"]),
-                    int(compress["jpeg_quality"]),
-                )
-                archive.writestr(f"images/{split}/{stem}.jpg", data)
+            if data is not None:
+                archive.writestr(f"images/{split}/{stem}.jpg", data, compress_type=zipfile.ZIP_STORED)
             else:
                 ext = image_path.suffix.lower()
-                archive.write(image_path, f"images/{split}/{stem}{ext}")
+                archive.write(image_path, f"images/{split}/{stem}{ext}", compress_type=zipfile.ZIP_STORED)
             if filtered is not None:
                 archive.writestr(f"labels/{split}/{stem}.txt", filtered)
             else:
@@ -443,7 +448,7 @@ def _zip_flat_dataset(
             "names": {index: name for index, name in enumerate(classes)},
         }
         archive.writestr("dataset.yaml", yaml.safe_dump(data, sort_keys=False))
-        _write_train_files(archive, model, export_onnx)
+        _write_train_files(archive, train)
     return zip_path
 
 
@@ -452,9 +457,9 @@ def format_to_train(config: dict[str, Any], progress: Progress | None = None) ->
     if not dataset.is_dir():
         raise FileNotFoundError(f"output_dir does not exist: {dataset}")
     dataset = dataset.resolve()
-    model = config["train"]["model"]
-    export_onnx = config["train"].get("export_onnx", True)
-    chosen_classes = config["train"].get("classes", [])
+    train = config["train"]
+    model = train["model"]
+    chosen_classes = train.get("classes", [])
     skip_ids = {int(cid) for cid in config.get("skip_classes", [])}
     report(progress, "Inspecting dataset")
 
@@ -468,10 +473,10 @@ def format_to_train(config: dict[str, Any], progress: Progress | None = None) ->
             dataset,
             dataset.parent / f"{dataset.name}_train",
             config["compress"],
-            model,
-            export_onnx,
+            train,
             chosen_classes,
             skip_ids,
+            config["workers"],
             progress,
         )
         script_path = _write_vastai_script(zip_path)
@@ -500,9 +505,9 @@ def format_to_train(config: dict[str, Any], progress: Progress | None = None) ->
             classes,
             dataset.parent / f"{dataset.name}_train",
             config["compress"],
-            model,
-            export_onnx,
+            train,
             skip_ids,
+            config["workers"],
             progress,
         )
         script_path = _write_vastai_script(zip_path)
@@ -527,9 +532,9 @@ def format_to_train(config: dict[str, Any], progress: Progress | None = None) ->
         int(config["seed"]),
         dataset.parent / f"{dataset.name}_train",
         config["compress"],
-        model,
-        export_onnx,
+        train,
         skip_ids,
+        config["workers"],
         progress,
     )
     script_path = _write_vastai_script(zip_path)
